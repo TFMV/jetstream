@@ -12,6 +12,7 @@
 *.test
 *cert*
 *key*
+*bench.db*
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*

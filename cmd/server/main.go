@@ -1,5 +1,4 @@
 //go:build duckdb_arrow
-// +build duckdb_arrow
 
 package main
 
@@ -13,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"io"
 	"log"
 	"math/big"
 	"time"
@@ -23,11 +23,16 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+/* -----------------------------
+   TLS CERT
+------------------------------*/
+
 func generateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
@@ -40,17 +45,25 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
+
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
+/* -----------------------------
+   Arrow IPC
+------------------------------*/
+
 func serializeIPC(schema *arrow.Schema, record arrow.Record) ([]byte, error) {
 	var buf bytes.Buffer
+
 	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
 	if err := w.Write(record); err != nil {
 		return nil, err
@@ -58,53 +71,70 @@ func serializeIPC(schema *arrow.Schema, record arrow.Record) ([]byte, error) {
 	if err := w.Close(); err != nil {
 		return nil, err
 	}
+
 	return buf.Bytes(), nil
 }
 
+/* -----------------------------
+   QUIC messaging (FIXED TYPES)
+------------------------------*/
+
 func sendMsg(stream *quic.Stream, msgType uint8, payload []byte) error {
+	// header
 	if err := binary.Write(stream, binary.BigEndian, msgType); err != nil {
 		return err
 	}
+
 	pLen := uint32(len(payload))
 	if err := binary.Write(stream, binary.BigEndian, pLen); err != nil {
 		return err
 	}
-	if len(payload) > 0 {
-		_, err := (*stream).Write(payload)
+
+	// payload
+	if pLen > 0 {
+		_, err := stream.Write(payload)
 		return err
 	}
+
 	return nil
 }
 
 func sendError(stream *quic.Stream, err error) {
-	payload := []byte(err.Error())
-	_ = sendMsg(stream, 0x04, payload)
+	_ = sendMsg(stream, 0x04, []byte(err.Error()))
 }
 
 func sendEnd(stream *quic.Stream) {
 	_ = sendMsg(stream, 0x03, nil)
 }
 
-func handleStream(stream *quic.Stream) {
-	defer (*stream).Close()
+/* -----------------------------
+   STREAM HANDLER (FIXED)
+------------------------------*/
 
-	// read query
+func handleStream(stream *quic.Stream) {
+	defer stream.Close()
+
+	// keepalive safety (prevents idle timeout during scans)
+	stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
+	// ---- read query ----
 	var queryLen uint32
 	if err := binary.Read(stream, binary.BigEndian, &queryLen); err != nil {
 		sendError(stream, err)
 		return
 	}
+
 	queryBytes := make([]byte, queryLen)
-	if _, err := (*stream).Read(queryBytes); err != nil {
+	if _, err := io.ReadFull(stream, queryBytes); err != nil {
 		sendError(stream, err)
 		return
 	}
-	query := string(queryBytes)
 
+	query := string(queryBytes)
 	log.Printf("Executing query: %s", query)
 
-	// DuckDB setup — exact pattern from working airport-go / duckdb-go Arrow examples
-	c, err := duckdb.NewConnector("", nil)
+	// ---- DuckDB ----
+	c, err := duckdb.NewConnector("bench.db", nil)
 	if err != nil {
 		sendError(stream, err)
 		return
@@ -131,50 +161,66 @@ func handleStream(stream *quic.Stream) {
 	}
 	defer rdr.Release()
 
-	// schema + first batch (if any)
-	if !rdr.Next() {
-		sendEnd(stream)
-		return
-	}
-	record := rdr.Record()
-	schema := record.Schema()
-	payload, err := serializeIPC(schema, record)
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-	if err := sendMsg(stream, 0x01, payload); err != nil {
-		return
-	}
-	record.Release()
+	// ---- streaming loop ----
+	first := true
+	var schema *arrow.Schema
 
-	// remaining batches
 	for rdr.Next() {
-		record = rdr.Record()
-		payload, err = serializeIPC(schema, record)
+		record := rdr.Record()
+
+		if schema == nil {
+			schema = record.Schema()
+		}
+
+		payload, err := serializeIPC(schema, record)
 		if err != nil {
 			sendError(stream, err)
+			record.Release()
 			return
 		}
-		if err := sendMsg(stream, 0x02, payload); err != nil {
+
+		var msgType uint8
+		if first {
+			msgType = 0x01
+			first = false
+		} else {
+			msgType = 0x02
+		}
+
+		if err := sendMsg(stream, msgType, payload); err != nil {
+			record.Release()
 			return
 		}
+
 		record.Release()
+
+		// prevent QUIC idle timeout during long scans
+		stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	}
 
 	sendEnd(stream)
 }
 
+/* -----------------------------
+   CONNECTION HANDLER (FIXED TYPE)
+------------------------------*/
+
 func handleConnection(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "")
+
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
+
 		go handleStream(stream)
 	}
 }
+
+/* -----------------------------
+   MAIN
+------------------------------*/
 
 func main() {
 	cert, err := generateSelfSignedCert()
@@ -187,7 +233,11 @@ func main() {
 		NextProtos:   []string{"vgi"},
 	}
 
-	listener, err := quic.ListenAddr(":4242", tlsConf, &quic.Config{})
+	cfg := &quic.Config{
+		KeepAlivePeriod: 10 * time.Second,
+	}
+
+	listener, err := quic.ListenAddr(":4242", tlsConf, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -200,6 +250,7 @@ func main() {
 		if err != nil {
 			continue
 		}
+
 		go handleConnection(conn)
 	}
 }
