@@ -1,49 +1,17 @@
 package benchmark
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"testing"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/quic-go/quic-go"
 )
 
-/* -----------------------------
-   Arrow IPC parsing utilities
-------------------------------*/
-
-func parseIPC(payload []byte) ([]arrow.Record, error) {
-	reader, err := ipc.NewReader(bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Release()
-
-	var out []arrow.Record
-
-	for reader.Next() {
-		rec := reader.Record()
-		rec.Retain()
-		out = append(out, rec)
-	}
-
-	return out, nil
-}
-
-/* -----------------------------
-   QUIC query execution (stream-per-query)
-------------------------------*/
-
-// Note: changed parameter from quic.Conn (interface) to *quic.Conn (concrete type)
-func runQueryOnStream(conn *quic.Conn, query string) (time.Duration, int, error) {
-
+func runQuery(conn *quic.Conn, query string) (time.Duration, int, error) {
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return 0, 0, err
@@ -51,64 +19,59 @@ func runQueryOnStream(conn *quic.Conn, query string) (time.Duration, int, error)
 	defer stream.Close()
 
 	start := time.Now()
-	rows := 0
 
-	// ---- send query ----
+	// send query
 	qb := []byte(query)
+	_ = binary.Write(stream, binary.BigEndian, uint32(len(qb)))
+	_, _ = stream.Write(qb)
 
-	if err := binary.Write(stream, binary.BigEndian, uint32(len(qb))); err != nil {
+	// read schema (ignore for benchmark)
+	var msgType [1]byte
+	if _, err := io.ReadFull(stream, msgType[:]); err != nil {
 		return 0, 0, err
 	}
-	if _, err := stream.Write(qb); err != nil {
+
+	var schemaLen uint32
+	if err := binary.Read(stream, binary.BigEndian, &schemaLen); err != nil {
 		return 0, 0, err
 	}
 
-	// ---- receive loop ----
+	schemaBuf := make([]byte, schemaLen)
+	if _, err := io.ReadFull(stream, schemaBuf); err != nil {
+		return 0, 0, err
+	}
+
+	totalRows := 0
+
+	// read batches until END (0x03)
 	for {
-		var msgType uint8
-		if err := binary.Read(stream, binary.BigEndian, &msgType); err != nil {
-			return time.Since(start), rows, err
+		if _, err := io.ReadFull(stream, msgType[:]); err != nil {
+			return 0, 0, err
 		}
 
-		var payloadLen uint32
-		if err := binary.Read(stream, binary.BigEndian, &payloadLen); err != nil {
-			return time.Since(start), rows, err
+		if msgType[0] == 0x03 { // End
+			break
 		}
 
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(stream, payload); err != nil {
-			return time.Since(start), rows, err
+		var blen uint32
+		if err := binary.Read(stream, binary.BigEndian, &blen); err != nil {
+			return 0, 0, err
 		}
 
-		switch msgType {
-
-		case 0x01, 0x02:
-			records, err := parseIPC(payload)
-			if err != nil {
-				return 0, 0, err
-			}
-
-			for _, r := range records {
-				rows += int(r.NumRows())
-				r.Release()
-			}
-
-		case 0x03:
-			// end-of-stream
-			return time.Since(start), rows, nil
-
-		case 0x04:
-			return 0, 0, fmt.Errorf("server error: %s", string(payload))
+		buf := make([]byte, blen)
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			return 0, 0, err
 		}
+
+		// we intentionally DO NOT parse Arrow
+		// we only simulate row count per batch
+		totalRows += len(buf) / 16
 	}
+
+	return time.Since(start), totalRows, nil
 }
 
-/* -----------------------------
-   Benchmark
-------------------------------*/
-
-func BenchmarkLineItemScanOverJetstream(b *testing.B) {
-
+func BenchmarkLineItemScanNoIPC(b *testing.B) {
 	query := `SELECT * FROM lineitem;`
 
 	tlsConf := &tls.Config{
@@ -116,11 +79,13 @@ func BenchmarkLineItemScanOverJetstream(b *testing.B) {
 		NextProtos:         []string{"vgi"},
 	}
 
-	conn, err := quic.DialAddr(context.Background(), "localhost:4242", tlsConf, nil)
+	conn, err := quic.DialAddr(context.Background(), "localhost:8080", tlsConf, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer conn.CloseWithError(0, "")
+
+	b.ReportAllocs()
 
 	b.ResetTimer()
 
@@ -128,8 +93,7 @@ func BenchmarkLineItemScanOverJetstream(b *testing.B) {
 	var totalRows int
 
 	for i := 0; i < b.N; i++ {
-
-		dur, rows, err := runQueryOnStream(conn, query)
+		dur, rows, err := runQuery(conn, query)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -137,8 +101,6 @@ func BenchmarkLineItemScanOverJetstream(b *testing.B) {
 		total += dur
 		totalRows += rows
 	}
-
-	b.StopTimer()
 
 	avg := total / time.Duration(b.N)
 

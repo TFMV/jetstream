@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -10,42 +9,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/quic-go/quic-go"
 )
-
-func parseIPC(payload []byte) (*arrow.Schema, []arrow.RecordBatch, error) {
-	reader, err := ipc.NewReader(bytes.NewReader(payload))
-	if err != nil {
-		return nil, nil, err
-	}
-	defer reader.Release()
-
-	schema := reader.Schema()
-	var batches []arrow.RecordBatch
-	for reader.Next() {
-		rec := reader.Record()
-		batches = append(batches, rec)
-	}
-	return schema, batches, nil
-}
-
-func printBatch(record arrow.RecordBatch) {
-	fmt.Printf("  Batch: %d rows, %d columns\n", record.NumRows(), record.NumCols())
-	if record.NumRows() == 0 {
-		return
-	}
-	if record.NumRows() > 20 {
-		fmt.Println("    (large - summary only)")
-		return
-	}
-	for i := 0; i < int(record.NumCols()); i++ {
-		col := record.Column(i)
-		field := record.Schema().Field(i)
-		fmt.Printf("    %s: %s\n", field.Name, col)
-	}
-}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -59,7 +24,7 @@ func main() {
 		NextProtos:         []string{"vgi"},
 	}
 
-	conn, err := quic.DialAddr(context.Background(), "localhost:4242", tlsConf, nil)
+	conn, err := quic.DialAddr(context.Background(), "localhost:8080", tlsConf, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,62 +37,70 @@ func main() {
 	defer stream.Close()
 
 	// send query
-	queryBytes := []byte(query)
-	if err := binary.Write(stream, binary.BigEndian, uint32(len(queryBytes))); err != nil {
+	qb := []byte(query)
+	if err := binary.Write(stream, binary.BigEndian, uint32(len(qb))); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := stream.Write(queryBytes); err != nil {
+	if _, err := stream.Write(qb); err != nil {
 		log.Fatal(err)
 	}
 
 	fmt.Printf("Query sent: %s\n", query)
 
-	for {
-		var msgType uint8
-		if err := binary.Read(stream, binary.BigEndian, &msgType); err != nil {
-			break
-		}
-
-		var payloadLen uint32
-		if err := binary.Read(stream, binary.BigEndian, &payloadLen); err != nil {
-			break
-		}
-
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(stream, payload); err != nil {
-			break
-		}
-
-		switch msgType {
-		case 0x01: // SCHEMA
-			fmt.Println("✓ SCHEMA received")
-			schema, batches, err := parseIPC(payload)
-			if err != nil {
-				fmt.Println("  parse error:", err)
-				continue
-			}
-			fmt.Println("  Schema:", schema)
-			for _, b := range batches {
-				printBatch(b)
-				b.Release()
-			}
-		case 0x02: // RECORD_BATCH
-			fmt.Println("✓ RECORD_BATCH received")
-			_, batches, err := parseIPC(payload)
-			if err != nil {
-				fmt.Println("  parse error:", err)
-				continue
-			}
-			for _, b := range batches {
-				printBatch(b)
-				b.Release()
-			}
-		case 0x03: // END
-			fmt.Println("✓ END OF STREAM")
-			return
-		case 0x04: // ERROR
-			fmt.Printf("✗ ERROR: %s\n", string(payload))
-			return
-		}
+	// read schema (first message from server)
+	var msgType [1]byte
+	if _, err := io.ReadFull(stream, msgType[:]); err != nil {
+		log.Fatal(err)
 	}
+	fmt.Printf("  Message type: 0x%02x\n", msgType[0])
+
+	if msgType[0] != 0x01 { // Schema
+		log.Fatalf("Expected schema message (0x01), got 0x%02x", msgType[0])
+	}
+
+	var schemaLen uint32
+	if err := binary.Read(stream, binary.BigEndian, &schemaLen); err != nil {
+		log.Fatal(err)
+	}
+
+	schemaBuf := make([]byte, schemaLen)
+	if _, err := io.ReadFull(stream, schemaBuf); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("✓ SCHEMA received (raw bytes, length:", schemaLen, "):", string(schemaBuf))
+
+	// read batches until END (0x03)
+	totalRows := 0
+	for {
+		if _, err := io.ReadFull(stream, msgType[:]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("  Message type: 0x%02x\n", msgType[0])
+
+		if msgType[0] == 0x03 { // End
+			fmt.Println("✓ END OF STREAM")
+			break
+		}
+
+		if msgType[0] != 0x02 { // RecordBatch
+			log.Fatalf("Expected record batch (0x02) or end (0x03), got 0x%02x", msgType[0])
+		}
+
+		var batchLen uint32
+		if err := binary.Read(stream, binary.BigEndian, &batchLen); err != nil {
+			log.Fatal(err)
+		}
+
+		buf := make([]byte, batchLen)
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			log.Fatal(err)
+		}
+
+		rowsInBatch := int(batchLen / 16)
+		totalRows += rowsInBatch
+		fmt.Printf("  Batch received: %d bytes (~%d rows)\n", batchLen, rowsInBatch)
+	}
+
+	fmt.Printf("Total rows received: %d\n", totalRows)
 }

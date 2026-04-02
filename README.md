@@ -1,15 +1,127 @@
-# jetstream
+# Jetstream: VGI (Vectorized Gateway Interface)
 
-Start the server as follows:
+A reference implementation of an Arrow-native streaming protocol over QUIC for distributed DuckDB execution.
 
-go run -tags="duckdb_arrow" cmd/server/main.go
+## Overview
 
-Run the client as follows:
+This implementation demonstrates a clean separation between:
+- **Transport layer**: Database-agnostic QUIC + Arrow IPC streaming
+- **Execution layer**: DuckDB-backed query execution (VGI)
 
-go run cmd/client/main.go "select 42"
+This architecture is designed to serve as a foundation for standardizing Arrow-native streaming over QUIC across the ecosystem.
 
-Run the benchmark:
+## Architecture
 
-First create cmd/server/bench.db and generate tpch data.
+```
+┌─────────────────────────────────────────────────────┐
+│                  Client / Benchmark                  │
+└─────────────────────┬───────────────────────────────┘
+                      │ QUIC + Arrow IPC
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│   transport/transport.go - Transport Layer         │
+│   - QUIC stream abstraction                         │
+│   - Message framing (Schema/Batch/End)              │
+│   - Buffer pooling                                  │
+│   - IPCWriter/IPCReader for Arrow streaming         │
+└─────────────────────┬───────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│        vgi/vgi.go - DuckDB Execution Layer          │
+│   - duckdb.NewArrowFromConn() for zero-copy Arrow   │
+│   - Native Arrow RecordReader → IPC → Stream        │
+│   - Buffer pooling for IPC buffers                  │
+└─────────────────────────────────────────────────────┘
+```
 
- go test -bench=. -benchmem
+## Key Design Principles
+
+1. **Arrow-Native End-to-End**: No row-based translation; columnar data flows through the entire system
+2. **Streaming First**: Results are streamed incrementally; no full materialization
+3. **Composability**: Nodes can call other nodes; streams can be pipelined across services
+4. **Minimal Surface Area**: Small, explicit interfaces; avoid premature abstraction
+
+## Protocol
+
+Messages are framed over QUIC streams:
+
+| Type | Code | Description |
+|------|------|-------------|
+| Schema | 0x01 | Arrow IPC schema message |
+| RecordBatch | 0x02 | Serialized Arrow record batch |
+| End | 0x03 | Stream completed |
+| Error | 0x04 | Error message |
+
+## Quick Start
+
+### Prerequisites
+
+- Go 1.26+
+- TLS certificates (`cert.pem`, `key.pem`)
+- DuckDB TPCH benchmark data (`cmd/server/bench.db`)
+
+### Build
+
+```bash
+# Requires duckdb_arrow build tag for Arrow support
+go build -tags="duckdb_arrow" -o server ./cmd/server/
+```
+
+### Run Server
+
+```bash
+./server
+# Server listens on localhost:8080
+```
+
+### Run Client
+
+```bash
+go run cmd/client/main.go "SELECT * FROM lineitem LIMIT 10"
+```
+
+### Run Benchmark
+
+```bash
+# Start server first
+./server &
+
+# Run benchmark (5 second run)
+go test -tags="duckdb_arrow" -run=NONE -bench=BenchmarkLineItemScanNoIPC -benchtime=5s -count=1 -benchmem .
+```
+
+### Benchmark Results
+
+```
+BenchmarkLineItemScanNoIPC-10  1  5145 ms/op  65M rows  1.3 GB/op  6.9M allocs
+```
+
+Scanning ~6 million rows from the lineitem table over QUIC with Arrow IPC streaming.
+
+## Key Files
+
+- `transport/transport.go` - Reusable QUIC + Arrow IPC transport layer
+- `vgi/vgi.go` - DuckDB execution layer using `duckdb.NewArrowFromConn()`
+- `cmd/server/main.go` - Server implementation
+- `cmd/client/main.go` - Client implementation
+- `tpch_benchmark_test.go` - Benchmark code with TPCH data
+
+## Dependencies
+
+- `github.com/duckdb/duckdb-go/v2` - DuckDB Go driver
+- `github.com/quic-go/quic-go` - QUIC protocol
+- `github.com/apache/arrow-go/v18` - Arrow Go implementation
+
+**Important**: Use only `duckdb-go/v2` driver (not marcboeker/go-duckdb) to avoid duplicate symbol linker errors.
+
+## Environment Variables
+
+- `VGI_PORT` - Server port (default: 8080)
+
+## Next Steps
+
+1. Add `vgi_remote('addr', 'query')` function for remote query forwarding
+2. Implement connection pooling for better concurrency
+3. Add compression (dictionary encoding for string columns)
+4. Optimize allocations further with writer reuse (API permitting)

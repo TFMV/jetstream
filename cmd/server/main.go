@@ -1,256 +1,183 @@
-//go:build duckdb_arrow
-
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/binary"
-	"encoding/pem"
-	"io"
 	"log"
-	"math/big"
-	"time"
+	"os"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/duckdb/duckdb-go/v2"
+	"github.com/TFMV/jetstream/transport"
+	"github.com/TFMV/jetstream/vgi"
+	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/quic-go/quic-go"
 )
 
-/* -----------------------------
-   TLS CERT
-------------------------------*/
-
-func generateSelfSignedCert() (tls.Certificate, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"VGI MVP"},
-		},
-		DNSNames:              []string{"localhost"},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-
-	return tls.X509KeyPair(certPEM, keyPEM)
-}
-
-/* -----------------------------
-   Arrow IPC
-------------------------------*/
-
-func serializeIPC(schema *arrow.Schema, record arrow.Record) ([]byte, error) {
-	var buf bytes.Buffer
-
-	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
-	if err := w.Write(record); err != nil {
-		return nil, err
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-/* -----------------------------
-   QUIC messaging (FIXED TYPES)
-------------------------------*/
-
-func sendMsg(stream *quic.Stream, msgType uint8, payload []byte) error {
-	// header
-	if err := binary.Write(stream, binary.BigEndian, msgType); err != nil {
-		return err
-	}
-
-	pLen := uint32(len(payload))
-	if err := binary.Write(stream, binary.BigEndian, pLen); err != nil {
-		return err
-	}
-
-	// payload
-	if pLen > 0 {
-		_, err := stream.Write(payload)
-		return err
-	}
-
-	return nil
-}
-
-func sendError(stream *quic.Stream, err error) {
-	_ = sendMsg(stream, 0x04, []byte(err.Error()))
-}
-
-func sendEnd(stream *quic.Stream) {
-	_ = sendMsg(stream, 0x03, nil)
-}
-
-/* -----------------------------
-   STREAM HANDLER (FIXED)
-------------------------------*/
-
-func handleStream(stream *quic.Stream) {
-	defer stream.Close()
-
-	// keepalive safety (prevents idle timeout during scans)
-	stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
-
-	// ---- read query ----
-	var queryLen uint32
-	if err := binary.Read(stream, binary.BigEndian, &queryLen); err != nil {
-		sendError(stream, err)
-		return
-	}
-
-	queryBytes := make([]byte, queryLen)
-	if _, err := io.ReadFull(stream, queryBytes); err != nil {
-		sendError(stream, err)
-		return
-	}
-
-	query := string(queryBytes)
-	log.Printf("Executing query: %s", query)
-
-	// ---- DuckDB ----
-	c, err := duckdb.NewConnector("bench.db", nil)
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-	defer c.Close()
-
-	conn, err := c.Connect(context.Background())
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-	defer conn.Close()
-
-	arrowIface, err := duckdb.NewArrowFromConn(conn)
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-
-	rdr, err := arrowIface.QueryContext(context.Background(), query)
-	if err != nil {
-		sendError(stream, err)
-		return
-	}
-	defer rdr.Release()
-
-	// ---- streaming loop ----
-	first := true
-	var schema *arrow.Schema
-
-	for rdr.Next() {
-		record := rdr.Record()
-
-		if schema == nil {
-			schema = record.Schema()
-		}
-
-		payload, err := serializeIPC(schema, record)
-		if err != nil {
-			sendError(stream, err)
-			record.Release()
-			return
-		}
-
-		var msgType uint8
-		if first {
-			msgType = 0x01
-			first = false
-		} else {
-			msgType = 0x02
-		}
-
-		if err := sendMsg(stream, msgType, payload); err != nil {
-			record.Release()
-			return
-		}
-
-		record.Release()
-
-		// prevent QUIC idle timeout during long scans
-		stream.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	}
-
-	sendEnd(stream)
-}
-
-/* -----------------------------
-   CONNECTION HANDLER (FIXED TYPE)
-------------------------------*/
-
-func handleConnection(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "")
-
-	for {
-		stream, err := conn.AcceptStream(context.Background())
-		if err != nil {
-			return
-		}
-
-		go handleStream(stream)
-	}
-}
-
-/* -----------------------------
-   MAIN
-------------------------------*/
-
-func main() {
-	cert, err := generateSelfSignedCert()
+func generateTLSConfig() *tls.Config {
+	certData, err := os.ReadFile("cert.pem")
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	tlsConf := &tls.Config{
+	keyData, err := os.ReadFile("key.pem")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certData, keyData)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"vgi"},
 	}
+}
 
-	cfg := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
+func main() {
+	port := "8080"
+	if p := os.Getenv("VGI_PORT"); p != "" {
+		port = p
 	}
 
-	listener, err := quic.ListenAddr(":4242", tlsConf, cfg)
+	tlsConf := generateTLSConfig()
+	t, err := transport.NewServer(tlsConf, "localhost:"+port)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to create transport: %v", err)
 	}
-	defer listener.Close()
+	defer t.Close()
 
-	log.Println("VGI server listening on :4242 (QUIC + DuckDB + Arrow)")
+	executor, err := vgi.New("/Users/tfmv/jetstream/jetstream/cmd/server/bench.db")
+	if err != nil {
+		log.Fatalf("Failed to create executor: %v", err)
+	}
+	defer executor.Close()
+
+	log.Printf("VGI Server listening on localhost:%s", port)
 
 	for {
-		conn, err := listener.Accept(context.Background())
+		stream, err := t.Accept(context.Background())
 		if err != nil {
+			log.Printf("Failed to accept stream: %v", err)
 			continue
 		}
 
-		go handleConnection(conn)
+		go handleStream(stream, executor)
 	}
+}
+
+func handleStream(qs *quic.Stream, executor *vgi.Executor) {
+	stream := &quicStreamAdapter{s: qs}
+	defer stream.Close()
+
+	queryLenBuf := make([]byte, 4)
+	if _, err := stream.Read(queryLenBuf); err != nil {
+		log.Printf("Failed to read query length: %v", err)
+		return
+	}
+	queryLen := uint32(queryLenBuf[0])<<24 | uint32(queryLenBuf[1])<<16 | uint32(queryLenBuf[2])<<8 | uint32(queryLenBuf[3])
+
+	query := make([]byte, queryLen)
+	if _, err := stream.Read(query); err != nil {
+		log.Printf("Failed to read query: %v", err)
+		return
+	}
+
+	if err := executor.Execute(string(query), stream); err != nil {
+		log.Printf("Query error: %v", err)
+	}
+}
+
+type quicStreamAdapter struct {
+	s *quic.Stream
+}
+
+func (a *quicStreamAdapter) SendSchema(b []byte) error {
+	_, err := a.s.Write([]byte{transport.MsgTypeSchema})
+	if err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	lenBuf[0] = byte(len(b) >> 24)
+	lenBuf[1] = byte(len(b) >> 16)
+	lenBuf[2] = byte(len(b) >> 8)
+	lenBuf[3] = byte(len(b))
+	_, err = a.s.Write(lenBuf[:])
+	if err != nil {
+		return err
+	}
+	_, err = a.s.Write(b)
+	return err
+}
+
+func (a *quicStreamAdapter) SendRecordBatch(b []byte) error {
+	_, err := a.s.Write([]byte{transport.MsgTypeRecordBatch})
+	if err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	lenBuf[0] = byte(len(b) >> 24)
+	lenBuf[1] = byte(len(b) >> 16)
+	lenBuf[2] = byte(len(b) >> 8)
+	lenBuf[3] = byte(len(b))
+	_, err = a.s.Write(lenBuf[:])
+	if err != nil {
+		return err
+	}
+	_, err = a.s.Write(b)
+	return err
+}
+
+func (a *quicStreamAdapter) SendEnd() error {
+	_, err := a.s.Write([]byte{transport.MsgTypeEnd})
+	if err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	_, err = a.s.Write(lenBuf[:])
+	return err
+}
+
+func (a *quicStreamAdapter) SendError(errMsg string) error {
+	_, err := a.s.Write([]byte{transport.MsgTypeError})
+	if err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	l := len(errMsg)
+	lenBuf[0] = byte(l >> 24)
+	lenBuf[1] = byte(l >> 16)
+	lenBuf[2] = byte(l >> 8)
+	lenBuf[3] = byte(l)
+	_, err = a.s.Write(lenBuf[:])
+	if err != nil {
+		return err
+	}
+	_, err = a.s.Write([]byte(errMsg))
+	return err
+}
+
+func (a *quicStreamAdapter) Read(p []byte) (int, error) {
+	return a.s.Read(p)
+}
+
+func (a *quicStreamAdapter) Recv() (byte, []byte, error) {
+	var typBuf [1]byte
+	if _, err := a.s.Read(typBuf[:]); err != nil {
+		return 0, nil, err
+	}
+	var lenBuf [4]byte
+	if _, err := a.s.Read(lenBuf[:]); err != nil {
+		return 0, nil, err
+	}
+	n := uint32(lenBuf[0])<<24 | uint32(lenBuf[1])<<16 | uint32(lenBuf[2])<<8 | uint32(lenBuf[3])
+	if n == 0 {
+		return typBuf[0], nil, nil
+	}
+	payload := make([]byte, n)
+	if _, err := a.s.Read(payload); err != nil {
+		return 0, nil, err
+	}
+	return typBuf[0], payload, nil
+}
+
+func (a *quicStreamAdapter) Close() error {
+	return a.s.Close()
 }
