@@ -39,6 +39,11 @@ func (e *Executor) Execute(query string, stream transport.Stream) error {
 	}
 	defer conn.Close()
 
+	if _, err := conn.ExecContext(ctx, "SET threads = 1;"); err != nil {
+		stream.SendError(err.Error())
+		return err
+	}
+
 	var driverConn driver.Conn
 	err = conn.Raw(func(c any) error {
 		driverConn = c.(driver.Conn)

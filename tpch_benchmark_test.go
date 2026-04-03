@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -53,19 +54,30 @@ func runQuery(conn *quic.Conn, query string) (time.Duration, int, error) {
 			break
 		}
 
+		if msgType[0] == 0x04 { // Error
+			var errLen uint32
+			if err := binary.Read(stream, binary.BigEndian, &errLen); err != nil {
+				return 0, 0, err
+			}
+			errBuf := make([]byte, errLen)
+			if _, err := io.ReadFull(stream, errBuf); err != nil {
+				return 0, 0, err
+			}
+			return 0, 0, fmt.Errorf("server error: %s", string(errBuf))
+		}
+
 		var blen uint32
 		if err := binary.Read(stream, binary.BigEndian, &blen); err != nil {
 			return 0, 0, err
 		}
 
-		buf := make([]byte, blen)
-		if _, err := io.ReadFull(stream, buf); err != nil {
+		n, err := io.Copy(io.Discard, io.LimitReader(stream, int64(blen)))
+		if err != nil {
 			return 0, 0, err
 		}
 
-		// we intentionally DO NOT parse Arrow
-		// we only simulate row count per batch
-		totalRows += len(buf) / 16
+		// simulate row count per batch
+		totalRows += int(n) / 16
 	}
 
 	return time.Since(start), totalRows, nil
