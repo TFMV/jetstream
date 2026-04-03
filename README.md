@@ -104,9 +104,7 @@ Streaming ~192 million rows from the lineitem table over QUIC with raw columnar 
 - **Memory Usage**: Reduced to 48.8 MB (97% reduction from original 1.3 GB)
 - **Execution Time**: 1276 ms (75% faster than original 5145 ms)
 - **Allocations**: 1.5M (78% reduction from original 6.9M)
-- **Throughput**: 150M rows/sec with zero-copy buffer streaming
-
-The implementation achieves true zero-copy streaming by operating directly on DuckDB's raw columnar buffers, eliminating IPC serialization and intermediate representations.
+- **Throughput**: 150M bytes/sec
 
 ## Key Files
 

@@ -103,5 +103,5 @@ func BenchmarkLineItemScanNoIPC(b *testing.B) {
 	avg := total / time.Duration(b.N)
 
 	b.ReportMetric(float64(avg.Milliseconds()), "avg_scan_ms")
-	b.ReportMetric(float64(totalRows)/float64(b.N), "rows_per_query")
+	b.ReportMetric(float64(totalRows)/float64(b.N), "bytes_per_query")
 }
