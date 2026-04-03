@@ -3,105 +3,100 @@ package vgi
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"sync"
 
 	"github.com/TFMV/jetstream/transport"
+	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-
-	"github.com/duckdb/duckdb-go/v2"
-	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 type Executor struct {
-	db  *sql.DB
-	mem memory.Allocator
+	db   adbc.Database
+	conn adbc.Connection
+	mem  memory.Allocator
 }
 
 func New(dbPath string) (*Executor, error) {
-	db, err := sql.Open("duckdb", dbPath)
+	var drv drivermgr.Driver
+
+	db, err := drv.NewDatabase(map[string]string{
+		"driver":  "duckdb",
+		"path":    dbPath,
+		"threads": "1",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
-	return &Executor{db: db, mem: memory.NewGoAllocator()}, nil
+
+	conn, err := db.Open(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open connection: %w", err)
+	}
+
+	return &Executor{db: db, conn: conn, mem: memory.NewGoAllocator()}, nil
 }
 
 func (e *Executor) Execute(query string, stream transport.Stream) error {
 	ctx := context.Background()
 
-	conn, err := e.db.Conn(ctx)
+	stmt, err := e.conn.NewStatement()
 	if err != nil {
 		stream.SendError(err.Error())
 		return err
 	}
-	defer conn.Close()
+	defer stmt.Close()
 
-	if _, err := conn.ExecContext(ctx, "SET threads = 1;"); err != nil {
-		stream.SendError(err.Error())
-		return err
-	}
-
-	var driverConn driver.Conn
-	err = conn.Raw(func(c any) error {
-		driverConn = c.(driver.Conn)
-		return nil
-	})
+	err = stmt.SetSqlQuery(query)
 	if err != nil {
 		stream.SendError(err.Error())
 		return err
 	}
 
-	arrowAPI, err := duckdb.NewArrowFromConn(driverConn)
-	if err != nil {
-		stream.SendError(err.Error())
-		return err
-	}
-
-	reader, err := arrowAPI.QueryContext(ctx, query)
+	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
 		stream.SendError(err.Error())
 		return err
 	}
 	defer reader.Release()
 
-	schema := reader.Schema()
-
-	schemaBuf := ipcBufPool.Get().(*bytes.Buffer)
-	schemaBuf.Reset()
-	defer ipcBufPool.Put(schemaBuf)
-
-	schemaWriter := ipc.NewWriter(schemaBuf, ipc.WithSchema(schema))
-	schemaWriter.Close()
-	stream.SendSchema(schemaBuf.Bytes())
-
+	var schema *arrow.Schema
 	buf := ipcBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer ipcBufPool.Put(buf)
 
 	for reader.Next() {
-		rec := reader.Record()
+		rec := reader.RecordBatch()
 		if rec == nil {
 			break
 		}
-		rec.Retain()
+
+		if schema == nil {
+			schema = rec.Schema()
+			schemaBuf := ipcBufPool.Get().(*bytes.Buffer)
+			schemaBuf.Reset()
+			defer ipcBufPool.Put(schemaBuf)
+
+			schemaWriter := ipc.NewWriter(schemaBuf, ipc.WithSchema(schema))
+			schemaWriter.Close()
+			stream.SendSchema(schemaBuf.Bytes())
+		}
 
 		buf.Reset()
 		wr := ipc.NewWriter(buf, ipc.WithSchema(schema), ipc.WithAllocator(e.mem))
 		if err := wr.Write(rec); err != nil {
-			rec.Release()
 			wr.Close()
 			stream.SendError(err.Error())
 			return err
 		}
 		if err := wr.Close(); err != nil {
-			rec.Release()
 			stream.SendError(err.Error())
 			return err
 		}
-		rec.Release()
 
 		if err := stream.SendRecordBatch(buf.Bytes()); err != nil {
 			stream.SendError(err.Error())
@@ -118,6 +113,10 @@ func (e *Executor) Execute(query string, stream transport.Stream) error {
 }
 
 func (e *Executor) Close() error {
+	if err := e.conn.Close(); err != nil {
+		e.db.Close()
+		return err
+	}
 	return e.db.Close()
 }
 

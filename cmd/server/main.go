@@ -8,7 +8,6 @@ import (
 
 	"github.com/TFMV/jetstream/transport"
 	"github.com/TFMV/jetstream/vgi"
-	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/quic-go/quic-go"
 )
 

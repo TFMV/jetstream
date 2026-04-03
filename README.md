@@ -64,8 +64,7 @@ Messages are framed over QUIC streams:
 ### Build
 
 ```bash
-# Requires duckdb_arrow build tag for Arrow support
-go build -tags="duckdb_arrow" -o server ./cmd/server/
+go build -o server ./cmd/server/
 ```
 
 ### Run Server
@@ -88,36 +87,41 @@ go run cmd/client/main.go "SELECT * FROM lineitem LIMIT 10"
 ./server &
 
 # Run benchmark (5 second run)
-go test -tags="duckdb_arrow" -run=NONE -bench=BenchmarkLineItemScanNoIPC -benchtime=5s -count=1 -benchmem .
+go test -run=NONE -bench=BenchmarkLineItemScanNoIPC -benchtime=5s -count=1 -benchmem .
 ```
 
 ### Benchmark Results
 
 ```
-BenchmarkLineItemScanNoIPC-10  1  5145 ms/op  65M rows  1.3 GB/op  6.9M allocs
+BenchmarkLineItemScanNoIPC-10  1  3127 ms/op  65M rows  224 MB/op  6.8M allocs
 ```
 
-Scanning ~6 million rows from the lineitem table over QUIC with Arrow IPC streaming.
+Scanning ~65 million rows from the lineitem table over QUIC with Arrow IPC streaming using ADBC.
+
+**Performance Improvements:**
+- **Memory Usage**: Reduced from 1.3 GB to 224 MB (83% reduction) through optimized streaming and buffer pooling
+- **Execution Time**: Improved from 5145 ms to 3127 ms (39% faster)
+- **Allocations**: Insanely high at ~6.8M, primarily from Arrow record creation and IPC serialization
 
 ## Key Files
 
 - `transport/transport.go` - Reusable QUIC + Arrow IPC transport layer
-- `vgi/vgi.go` - DuckDB execution layer using `duckdb.NewArrowFromConn()`
+- `vgi/vgi.go` - DuckDB execution layer using ADBC
 - `cmd/server/main.go` - Server implementation
 - `cmd/client/main.go` - Client implementation
 - `tpch_benchmark_test.go` - Benchmark code with TPCH data
 
-## Dependencies
-
-- `github.com/duckdb/duckdb-go/v2` - DuckDB Go driver
-- `github.com/quic-go/quic-go` - QUIC protocol
-- `github.com/apache/arrow-go/v18` - Arrow Go implementation
-
-**Important**: Use only `duckdb-go/v2` driver (not marcboeker/go-duckdb) to avoid duplicate symbol linker errors.
-
 ## Environment Variables
 
 - `VGI_PORT` - Server port (default: 8080)
+
+## Dependencies
+
+- `github.com/apache/arrow-adbc/go/adbc` - Arrow Database Connectivity for DuckDB
+- `github.com/quic-go/quic-go` - QUIC protocol
+- `github.com/apache/arrow-go/v18` - Arrow Go implementation
+
+**Important**: Uses ADBC driver for optimized Arrow-native database access. Requires DuckDB ADBC driver to be installed on the system.
 
 ## Next Steps
 
