@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -42,9 +41,9 @@ func runQuery(conn *quic.Conn, query string) (time.Duration, int, error) {
 		return 0, 0, err
 	}
 
-	totalRows := 0
+	totalBytes := 0
 
-	// read batches until END (0x03)
+	// read chunks until END (0x03)
 	for {
 		if _, err := io.ReadFull(stream, msgType[:]); err != nil {
 			return 0, 0, err
@@ -54,33 +53,20 @@ func runQuery(conn *quic.Conn, query string) (time.Duration, int, error) {
 			break
 		}
 
-		if msgType[0] == 0x04 { // Error
-			var errLen uint32
-			if err := binary.Read(stream, binary.BigEndian, &errLen); err != nil {
-				return 0, 0, err
-			}
-			errBuf := make([]byte, errLen)
-			if _, err := io.ReadFull(stream, errBuf); err != nil {
-				return 0, 0, err
-			}
-			return 0, 0, fmt.Errorf("server error: %s", string(errBuf))
-		}
-
-		var blen uint32
-		if err := binary.Read(stream, binary.BigEndian, &blen); err != nil {
+		var chunkLen uint32
+		if err := binary.Read(stream, binary.BigEndian, &chunkLen); err != nil {
 			return 0, 0, err
 		}
 
-		n, err := io.Copy(io.Discard, io.LimitReader(stream, int64(blen)))
+		n, err := io.Copy(io.Discard, io.LimitReader(stream, int64(chunkLen)))
 		if err != nil {
 			return 0, 0, err
 		}
 
-		// simulate row count per batch
-		totalRows += int(n) / 16
+		totalBytes += int(n)
 	}
 
-	return time.Since(start), totalRows, nil
+	return time.Since(start), totalBytes, nil
 }
 
 func BenchmarkLineItemScanNoIPC(b *testing.B) {
