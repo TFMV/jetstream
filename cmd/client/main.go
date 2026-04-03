@@ -70,8 +70,8 @@ func main() {
 
 	fmt.Println("✓ SCHEMA received (raw bytes, length:", schemaLen, "):", string(schemaBuf))
 
-	// read batches until END (0x03)
-	totalRows := 0
+	// read chunks until END (0x03)
+	totalBytes := 0
 	for {
 		if _, err := io.ReadFull(stream, msgType[:]); err != nil {
 			log.Fatal(err)
@@ -83,24 +83,23 @@ func main() {
 			break
 		}
 
-		if msgType[0] != 0x02 { // RecordBatch
-			log.Fatalf("Expected record batch (0x02) or end (0x03), got 0x%02x", msgType[0])
+		if msgType[0] != 0x02 { // Chunk
+			log.Fatalf("Expected chunk (0x02) or end (0x03), got 0x%02x", msgType[0])
 		}
 
-		var batchLen uint32
-		if err := binary.Read(stream, binary.BigEndian, &batchLen); err != nil {
+		var chunkLen uint32
+		if err := binary.Read(stream, binary.BigEndian, &chunkLen); err != nil {
 			log.Fatal(err)
 		}
 
-		buf := make([]byte, batchLen)
+		buf := make([]byte, chunkLen)
 		if _, err := io.ReadFull(stream, buf); err != nil {
 			log.Fatal(err)
 		}
 
-		rowsInBatch := int(batchLen / 16)
-		totalRows += rowsInBatch
-		fmt.Printf("  Batch received: %d bytes (~%d rows)\n", batchLen, rowsInBatch)
+		totalBytes += int(chunkLen)
+		fmt.Printf("  Chunk received: %d bytes\n", chunkLen)
 	}
 
-	fmt.Printf("Total rows received: %d\n", totalRows)
+	fmt.Printf("Total bytes received: %d\n", totalBytes)
 }

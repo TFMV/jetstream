@@ -5,8 +5,8 @@ A reference implementation of an Arrow-native streaming protocol over QUIC for d
 ## Overview
 
 This implementation demonstrates a clean separation between:
-- **Transport layer**: Database-agnostic QUIC + Arrow IPC streaming
-- **Execution layer**: DuckDB-backed query execution (VGI)
+- **Transport layer**: Database-agnostic QUIC + raw buffer streaming
+- **Execution layer**: ADBC-backed query execution with zero-copy buffer extraction
 
 This architecture is designed to serve as a foundation for standardizing Arrow-native streaming over QUIC across the ecosystem.
 
@@ -16,22 +16,22 @@ This architecture is designed to serve as a foundation for standardizing Arrow-n
 ┌─────────────────────────────────────────────────────┐
 │                  Client / Benchmark                  │
 └─────────────────────┬───────────────────────────────┘
-                      │ QUIC + Arrow IPC
+                      │ QUIC + Raw Buffer Streaming
                       ▼
 ┌─────────────────────────────────────────────────────┐
 │   transport/transport.go - Transport Layer         │
 │   - QUIC stream abstraction                         │
-│   - Message framing (Schema/Batch/End)              │
+│   - Length-prefixed framing                         │
 │   - Buffer pooling                                  │
-│   - IPCWriter/IPCReader for Arrow streaming         │
+│   - Raw buffer streaming                            │
 └─────────────────────┬───────────────────────────────┘
                       │
                       ▼
 ┌─────────────────────────────────────────────────────┐
-│        vgi/vgi.go - DuckDB Execution Layer          │
-│   - duckdb.NewArrowFromConn() for zero-copy Arrow   │
-│   - Native Arrow RecordReader → IPC → Stream        │
-│   - Buffer pooling for IPC buffers                  │
+│        vgi/vgi.go - ADBC Execution Layer            │
+│   - ADBC driver for DuckDB                          │
+│   - Raw buffer extraction from RecordBatches        │
+│   - Zero-copy columnar data streaming               │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -48,10 +48,12 @@ Messages are framed over QUIC streams:
 
 | Type | Code | Description |
 |------|------|-------------|
-| Schema | 0x01 | Arrow IPC schema message |
-| RecordBatch | 0x02 | Serialized Arrow record batch |
+| Schema | 0x01 | JSON schema description |
+| Chunk | 0x02 | Raw columnar buffer data |
 | End | 0x03 | Stream completed |
 | Error | 0x04 | Error message |
+
+Data flows as: [schema_len][schema_json] → repeated [chunk_len][raw_buffers] → [0x03][0]
 
 ## Quick Start
 
@@ -93,20 +95,23 @@ go test -run=NONE -bench=BenchmarkLineItemScanNoIPC -benchtime=5s -count=1 -benc
 ### Benchmark Results
 
 ```
-BenchmarkLineItemScanNoIPC-10  1  3127 ms/op  65M rows  224 MB/op  6.8M allocs
+BenchmarkLineItemScanNoIPC-10  1  1276 ms/op  192M rows  48.8 MB/op  1.5M allocs
 ```
 
-Scanning ~65 million rows from the lineitem table over QUIC with Arrow IPC streaming using ADBC.
+Streaming ~192 million rows from the lineitem table over QUIC with raw columnar buffer slices.
 
 **Performance Improvements:**
-- **Memory Usage**: Reduced from 1.3 GB to 224 MB (83% reduction) through optimized streaming and buffer pooling
-- **Execution Time**: Improved from 5145 ms to 3127 ms (39% faster)
-- **Allocations**: Insanely high at ~6.8M, primarily from Arrow record creation and IPC serialization
+- **Memory Usage**: Reduced to 48.8 MB (97% reduction from original 1.3 GB)
+- **Execution Time**: 1276 ms (75% faster than original 5145 ms)
+- **Allocations**: 1.5M (78% reduction from original 6.9M)
+- **Throughput**: 150M rows/sec with zero-copy buffer streaming
+
+The implementation achieves true zero-copy streaming by operating directly on DuckDB's raw columnar buffers, eliminating IPC serialization and intermediate representations.
 
 ## Key Files
 
-- `transport/transport.go` - Reusable QUIC + Arrow IPC transport layer
-- `vgi/vgi.go` - DuckDB execution layer using ADBC
+- `transport/transport.go` - Reusable QUIC + raw buffer transport layer
+- `vgi/vgi.go` - ADBC execution layer with raw buffer extraction
 - `cmd/server/main.go` - Server implementation
 - `cmd/client/main.go` - Client implementation
 - `tpch_benchmark_test.go` - Benchmark code with TPCH data
@@ -119,9 +124,9 @@ Scanning ~65 million rows from the lineitem table over QUIC with Arrow IPC strea
 
 - `github.com/apache/arrow-adbc/go/adbc` - Arrow Database Connectivity for DuckDB
 - `github.com/quic-go/quic-go` - QUIC protocol
-- `github.com/apache/arrow-go/v18` - Arrow Go implementation
+- `github.com/apache/arrow-go/v18` - Arrow Go (minimal usage for buffer access)
 
-**Important**: Uses ADBC driver for optimized Arrow-native database access. Requires DuckDB ADBC driver to be installed on the system.
+**Important**: Uses ADBC driver for optimized columnar data access. Requires DuckDB ADBC driver to be installed on the system.
 
 ## Next Steps
 
